@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 
 SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -24,8 +25,15 @@ COV = "/tmp/cov/.coverage"
 BLAST = "/tmp/blast"
 
 
+T0 = time.time()
+
+
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+def tick(label):
+    log(f"[timing] {time.time() - T0:6.0f}s since build_map started: {label}")
 
 
 def fetch():
@@ -52,6 +60,9 @@ def env():
         COVERAGE_FILE=COV,
         BLAST_OUT=BLAST,
         PYTHONDONTWRITEBYTECODE="1",
+        # The tests size their process pools from the CPU count. Pin it to the grader's 4 so the
+        # build behaves the same on any machine (a 22-core PC would otherwise start 22 workers per pool).
+        PYTHON_CPU_COUNT="4",
     )
 
 
@@ -185,6 +196,8 @@ def run_groups(ids_list, index):
     log("pool-using tests:", len(pool), "| run alone:", len(slow), "| shared:", len(light))
     for n in slow:
         log(f"  alone: {dur[n]:6.1f}s {n}")
+    for n, t in sorted(dur.items(), key=lambda kv: -kv[1])[:8]:
+        log(f"  slowest in main run: {t:6.1f}s {n}")
 
     shared = run_cov(light, "shared", True)
     # Sanity check: a function body that only the pool workers run must show up.
@@ -196,6 +209,7 @@ def run_groups(ids_list, index):
     if not ran:
         raise SystemExit("worker processes were not measured: failing the build rather than ship a bad map")
     groups = [(shared, {index[n] for n in light})]
+    tick("shared pool run finished")
 
     def one(a):
         i, n = a
@@ -314,6 +328,75 @@ def dialect_descendants(names, root=None):
     return out
 
 
+def test_importers(root=None):
+    """tests/x.py -> every tests file that (transitively) imports it."""
+    root = root or SRC
+    files = [os.path.relpath(p, root).replace(os.sep, "/")
+             for p in glob.glob(os.path.join(root, "tests", "**", "*.py"), recursive=True)]
+    have = set(files)
+
+    def resolve(mod):
+        for cand in (mod.replace(".", "/") + ".py", mod.replace(".", "/") + "/__init__.py"):
+            if cand in have:
+                return cand
+        return None
+
+    imports = {f: set() for f in files}
+    for f in files:
+        try:
+            tree = ast.parse(open(os.path.join(root, f)).read())
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            mods = []
+            if isinstance(n, ast.ImportFrom) and n.module and n.level == 0:
+                mods.append(n.module)
+                mods += [n.module + "." + a.name for a in n.names]
+            elif isinstance(n, ast.Import):
+                mods += [a.name for a in n.names]
+            for m in mods:
+                r = resolve(m)
+                if r and r != f:
+                    imports[f].add(r)
+    users = {f: set() for f in files}
+    for f, deps in imports.items():
+        for d in deps:
+            users[d].add(f)
+    out = {}
+    for f in files:
+        seen, todo = set(), [f]
+        while todo:
+            for u in users[todo.pop()]:
+                if u not in seen:
+                    seen.add(u)
+                    todo.append(u)
+        if seen:
+            out[f] = sorted(seen)
+    return out
+
+
+def find_noimport():
+    """sqlglot modules that do not import cleanly here; the selector skips its import check for them."""
+    code = (
+        "import importlib, json, os, sys\n"
+        "root = sys.argv[1]; bad = []\n"
+        "for dp, dn, fn in os.walk(os.path.join(root, 'sqlglot')):\n"
+        "    for f in fn:\n"
+        "        if not f.endswith('.py') or f == '__main__.py': continue\n"
+        "        rel = os.path.relpath(os.path.join(dp, f), root)\n"
+        "        mod = rel[:-3].replace(os.sep, '.')\n"
+        "        if mod.endswith('.__init__'): mod = mod[:-9]\n"
+        "        try: importlib.import_module(mod)\n"
+        "        except BaseException: bad.append(rel.replace(os.sep, '/'))\n"
+        "print('JSON' + json.dumps(sorted(bad)))\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code, SRC], env=env(), capture_output=True, text=True)
+    line = next((l for l in r.stdout.splitlines() if l.startswith("JSON")), "JSON[]")
+    bad = json.loads(line[4:])
+    log("modules that do not import cleanly:", bad)
+    return bad
+
+
 def dialect_names():
     d = os.path.join(SRC, "sqlglot", "dialects")
     return sorted(
@@ -374,11 +457,16 @@ def scan_mentions(names, ids):
 
 def main():
     fetch()
+    tick('sqlglot fetched')
     ids_list = collect_ids()
+    tick('tests collected')
     run_tests()
+    tick('main coverage run finished')
     index = {nid: i for i, nid in enumerate(ids_list)}
     groups = run_groups(ids_list, index)
+    tick('pool groups finished')
     units, filehit = read_coverage(index, groups)
+    tick('coverage read')
     names = dialect_names()
     mentions = scan_mentions(names, index)
 
@@ -433,9 +521,12 @@ def main():
         "mentions": {k: sorted(v) for k, v in mentions.items()},
         "dialects": names,
         "desc": dialect_descendants(names),
+        "testimp": test_importers(),
+        "noimport": find_noimport(),
     }
     with gzip.open(OUT, "wt", compresslevel=6) as fh:
         json.dump(m, fh, separators=(",", ":"))
+    tick('map written')
     log(f"map: {len(ids_out)} ids, {len(units)} files, {len(fix)} fixtures, "
         f"{os.path.getsize(OUT) / 1e6:.1f} MB")
 
