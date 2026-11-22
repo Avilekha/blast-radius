@@ -224,8 +224,9 @@ class Sel:
         if top:
             sel |= self.conv(M["filehit"].get(path, []))
             if dm and dm.group(1) in self.dialects:
-                sel |= self.conv(M["mentions"].get(dm.group(1), []))
-                sel |= set(self.by_file.get(f"tests/dialects/test_{dm.group(1)}.py", []))
+                for n in {dm.group(1)} | set(M.get("desc", {}).get(dm.group(1), ())):
+                    sel |= self.conv(M["mentions"].get(n, []))
+                    sel |= set(self.by_file.get(f"tests/dialects/test_{n}.py", []))
         return sel
 
     def file(self, fp):

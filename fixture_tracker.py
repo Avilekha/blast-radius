@@ -30,7 +30,10 @@ def _note(f):
         if not rel.startswith("tests/fixtures/"):
             return
         kind, key = _state["kind"], _state["key"]
-        if kind == "t":
+        if kind == "t" and _state.get("phase") in ("setup", "teardown"):
+            # class/module-scoped setup runs inside the first test's setup, but serves every test
+            _mods.setdefault(key.split("::")[0], set()).add(rel)
+        elif kind == "t":
             _tests.setdefault(key, set()).add(rel)
         elif kind == "m":
             _mods.setdefault(key, set()).add(rel)
@@ -63,6 +66,21 @@ def pytest_collection_finish(session):
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_logstart(nodeid, location):
     _state.update(kind="t", key=nodeid)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    _state["phase"] = "setup"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    _state["phase"] = "call"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    _state["phase"] = "teardown"
 
 
 def pytest_runtest_logfinish(nodeid, location):

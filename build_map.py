@@ -160,6 +160,9 @@ def read_coverage(index, group_lines, group_ids):
     cd.read()
     units, filehit = {}, {}
     gset = {index[i] for i in group_ids}
+    by_mod = {}
+    for nid, i in index.items():
+        by_mod.setdefault(nid.split("::")[0], set()).add(i)
     todo = {}
     for f in cd.measured_files():
         todo[os.path.relpath(f, SRC).replace(os.sep, "/")] = f
@@ -197,18 +200,58 @@ def read_coverage(index, group_lines, group_ids):
         for ln, ctxs in by_line.items():
             ids = set()
             for c in ctxs:
-                nid = c.rsplit("|", 1)[0]
+                nid, _, phase = c.rpartition("|")
                 if not nid:
                     continue
                 if nid not in index:
                     index[nid] = len(index)
                 ids.add(index[nid])
+                if phase in ("setup", "teardown"):
+                    # setUpClass / module fixtures run inside the first test's setup but serve all of them
+                    ids |= by_mod.get(nid.split("::")[0], set())
             fh |= ids
             if ln < len(owner) and owner[ln] != -1:
                 hits[owner[ln]] |= ids
         units[rel] = [[u[0], u[1], u[2], sorted(h)] for u, h in zip(us, hits)]
         filehit[rel] = sorted(fh)
     return units, filehit
+
+
+def dialect_descendants(names, root=None):
+    """For each dialect file stem: every stem that (transitively) imports from it."""
+    root = root or SRC
+    dirs = ("dialects", "parsers", "generators", "typing")
+    deps = {n: set() for n in names}
+    for d in dirs:
+        for p in glob.glob(os.path.join(root, "sqlglot", d, "*.py")):
+            stem = os.path.basename(p)[:-3]
+            if stem not in deps:
+                continue
+            try:
+                tree = ast.parse(open(p).read())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or not node.module:
+                    continue
+                parts = node.module.split(".")
+                if parts[0] != "sqlglot" or len(parts) < 2 or parts[1] not in dirs:
+                    continue
+                if len(parts) >= 3 and parts[2] in deps and parts[2] != stem:
+                    deps[stem].add(parts[2])
+                if len(parts) == 2:
+                    deps[stem] |= {a.name for a in node.names if a.name in deps and a.name != stem}
+    kids = {n: {a for a in names if n in deps[a]} for n in names}
+    out = {}
+    for n in names:
+        seen, todo = set(), [n]
+        while todo:
+            for k in kids[todo.pop()]:
+                if k not in seen:
+                    seen.add(k)
+                    todo.append(k)
+        out[n] = sorted(seen - {n})
+    return out
 
 
 def dialect_names():
@@ -331,6 +374,7 @@ def main():
         "fixall": sorted(fixall),
         "mentions": {k: sorted(v) for k, v in mentions.items()},
         "dialects": names,
+        "desc": dialect_descendants(names),
     }
     with gzip.open(OUT, "wt", compresslevel=6) as fh:
         json.dump(m, fh, separators=(",", ":"))
