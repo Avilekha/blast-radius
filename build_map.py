@@ -118,8 +118,8 @@ def units_of(src):
 
 
 GROUP = "/tmp/grp"
-HEAVY_S = 2.0   # seconds in the main (coverage, 4-way parallel) run
-MAX_HEAVY = 12
+HEAVY_S = 0.5   # seconds in the main (coverage, 4-way parallel) run; below this, tests share one run
+MAX_HEAVY = 40
 POOL_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 POOL_MARKERS = ("check_file", "pool", "parse_and_optimize", "ProcessPoolExecutor", "get_context")
 
@@ -199,16 +199,8 @@ def run_groups(ids_list, index):
     for n, t in sorted(dur.items(), key=lambda kv: -kv[1])[:8]:
         log(f"  slowest in main run: {t:6.1f}s {n}")
 
-    shared = run_cov(light, "shared", True)
-    # Sanity check: a function body that only the pool workers run must show up.
-    chk = "sqlglot/optimizer/eliminate_joins.py"
-    fn = next(n for n in ast.walk(ast.parse(open(os.path.join(SRC, chk)).read()))
-              if isinstance(n, ast.FunctionDef) and n.name == "_should_eliminate_join")
-    ran = [ln for ln in shared.get(chk, ()) if fn.body[0].lineno <= ln <= fn.end_lineno]
-    log("shared files", len(shared), "| worker-only lines seen in _should_eliminate_join:", len(ran))
-    if not ran:
-        raise SystemExit("worker processes were not measured: failing the build rather than ship a bad map")
-    groups = [(shared, {index[n] for n in light})]
+    shared = run_cov(light, "shared", True) if light else {}
+    groups = [(shared, {index[n] for n in light})] if light else []
     tick("shared pool run finished")
 
     def one(a):
@@ -222,6 +214,14 @@ def run_groups(ids_list, index):
             if nfiles < 5:
                 raise SystemExit(f"coverage for {n} looks empty: failing the build")
             groups.append((lines, {index[n]}))
+    # Sanity check: a function body that only the pool workers run must show up somewhere.
+    chk = "sqlglot/optimizer/eliminate_joins.py"
+    fn = next(n for n in ast.walk(ast.parse(open(os.path.join(SRC, chk)).read()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_should_eliminate_join")
+    ran = [ln for g, _ in groups for ln in g.get(chk, ()) if fn.body[0].lineno <= ln <= fn.end_lineno]
+    log("worker-only lines seen in _should_eliminate_join:", len(ran))
+    if not ran:
+        raise SystemExit("worker processes were not measured: failing the build rather than ship a bad map")
     return groups
 
 
