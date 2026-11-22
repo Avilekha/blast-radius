@@ -9,6 +9,7 @@ import glob
 import gzip
 import io
 import json
+import marshal
 import os
 import re
 import shutil
@@ -526,6 +527,11 @@ def main():
     }
     with gzip.open(OUT, "wt", compresslevel=6) as fh:
         json.dump(m, fh, separators=(",", ":"))
+    try:  # same data in a format that loads about twice as fast; the selector falls back to the .gz
+        with open(OUT[:-len(".json.gz")] + ".bin", "wb") as fh:
+            marshal.dump(m, fh)
+    except Exception as e:
+        log("binary map skipped:", repr(e))
     tick('map written')
     log(f"map: {len(ids_out)} ids, {len(units)} files, {len(fix)} fixtures, "
         f"{os.path.getsize(OUT) / 1e6:.1f} MB")

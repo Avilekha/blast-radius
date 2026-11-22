@@ -7,6 +7,7 @@ that dialect. Anything we cannot analyse falls back to running everything.
 """
 import ast
 import gzip
+import marshal
 import json
 import os
 import re
@@ -19,7 +20,7 @@ DATA = Path(os.environ.get("DATA_DIR", "/data"))
 MAP_PATH = os.environ.get("MAP_PATH", "/app/map.json.gz")
 SRC = Path(os.environ.get("SRC_DIR", "/opt/sqlglot"))
 MAX_WORKERS, WORKER_MS = 8, 2000
-SWEEP_S = 5.0  # seconds: slower tests count as sweeps (see py_file)
+SWEEP_S = 1.0  # seconds: unnamed or all-dialect tests at least this slow are dropped for class-level dialect edits (see py_file)
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 DIALECT_FILE = re.compile(r"^sqlglot/(?:dialects|generators|parsers|typing)/([a-z0-9_]+)\.py$")
 ALL_ROOT = {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py",
@@ -402,6 +403,17 @@ def split(sel, ms):
     return [w for w in best[1] if w]
 
 
+def load_map():
+    if MAP_PATH.endswith(".json.gz"):
+        try:
+            with open(MAP_PATH[:-len(".json.gz")] + ".bin", "rb") as fh:
+                return marshal.load(fh)
+        except Exception:
+            pass  # missing or unreadable: use the portable copy
+    with gzip.open(MAP_PATH, "rt") as fh:
+        return json.load(fh)
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = [0] * len(tests)
@@ -409,8 +421,7 @@ def main():
         ms[t["number"]] = round(t["seconds"] * 1000)
     everything = set(range(len(tests)))
     try:
-        with gzip.open(MAP_PATH, "rt") as fh:
-            sel = Sel(json.load(fh), tests)
+        sel = Sel(load_map(), tests)
     except Exception as e:
         log("map unavailable, running everything:", e)
         sel = None
