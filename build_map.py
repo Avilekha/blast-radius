@@ -72,10 +72,29 @@ def run_tests():
     cmd = [
         sys.executable, "-m", "pytest", "tests", "-n", "4", "-q", "-p", "fixture_tracker",
         "-p", "no:cacheprovider", "--cov=sqlglot", "--cov=tests", "--cov-context=test",
-        "--cov-report=", "--timeout=300",
+        "--cov-report=", "--timeout=300", "--junitxml=/tmp/junit.xml",
     ]
     r = subprocess.run(cmd, cwd=SRC, env=env())
     log("pytest exit", r.returncode)
+
+
+def durations():
+    """nodeid (no params) -> seconds, from the main run's junit file."""
+    import xml.etree.ElementTree as ET
+
+    out = {}
+    try:
+        for tc in ET.parse("/tmp/junit.xml").getroot().iter("testcase"):
+            parts = (tc.get("classname") or "").split(".")
+            k = next((i for i, p in enumerate(parts) if p.startswith("test_")), None)
+            if k is None:
+                continue
+            nid = "/".join(parts[: k + 1]) + ".py"
+            nid += "".join("::" + p for p in parts[k + 1 :]) + "::" + (tc.get("name") or "").split("[")[0]
+            out[nid] = max(out.get(nid, 0.0), float(tc.get("time") or 0))
+    except Exception as e:
+        log("no durations:", e)
+    return out
 
 
 def units_of(src):
@@ -88,6 +107,8 @@ def units_of(src):
 
 
 GROUP = "/tmp/grp"
+HEAVY_S = 2.0   # seconds in the main (coverage, 4-way parallel) run
+MAX_HEAVY = 12
 POOL_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 POOL_MARKERS = ("check_file", "pool", "parse_and_optimize", "ProcessPoolExecutor", "get_context")
 
@@ -119,55 +140,92 @@ def pool_tests(ids_list, src_root=None):
     return sorted(i for i in ids_list if i.split("[")[0] in out)
 
 
-def run_group(ids):
-    """Run only the pool-using tests with coverage that follows spawned worker processes."""
+def run_cov(ids, tag, xdist):
+    """Run the given tests with coverage that follows spawned worker processes."""
     import coverage
 
-    shutil.rmtree(GROUP, ignore_errors=True)
-    os.makedirs(GROUP)
-    rc = os.path.join(GROUP, "rc")
+    d = os.path.join(GROUP, tag)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    rc = os.path.join(d, "rc")
     with open(rc, "w") as fh:
         fh.write("[run]\nparallel = True\npatch = subprocess\nsource =\n    sqlglot\n    tests\n")
     e = env()
-    e["COVERAGE_FILE"] = os.path.join(GROUP, ".coverage")
-    cmd = [sys.executable, "-m", "coverage", "run", "--rcfile", rc, "-m", "pytest", "-n", "4", "-q",
-           "-p", "no:cacheprovider", "--timeout=300", *ids]
-    r = subprocess.run(cmd, cwd=SRC, env=e)
-    log("group pytest exit", r.returncode, "tests", len(ids))
-    r = subprocess.run([sys.executable, "-m", "coverage", "combine", "--rcfile", rc, GROUP], cwd=SRC, env=e)
-    log("group combine exit", r.returncode)
+    e["COVERAGE_FILE"] = os.path.join(d, ".coverage")
+    cmd = [sys.executable, "-m", "coverage", "run", "--rcfile", rc, "-m", "pytest"]
+    cmd += ["-n", "4"] if xdist else []
+    cmd += ["-q", "-p", "no:cacheprovider", "--timeout=300", *ids]
+    r = subprocess.run(cmd, cwd=SRC, env=e, stdout=sys.stderr)
+    r2 = subprocess.run([sys.executable, "-m", "coverage", "combine", "--rcfile", rc, d],
+                        cwd=SRC, env=e, stdout=sys.stderr, stderr=sys.stderr)
+    log(f"[{tag}] pytest exit {r.returncode}, combine exit {r2.returncode}, tests {len(ids)}")
     cd = coverage.CoverageData(basename=e["COVERAGE_FILE"])
     cd.read()
     out = {}
     for f in cd.measured_files():
         rel = os.path.relpath(f, SRC).replace(os.sep, "/")
         out[rel] = set(cd.lines(f) or [])
-    # Sanity check: a function body that only the pool workers run in these tests must show up.
-    chk = "sqlglot/optimizer/eliminate_joins.py"
-    fn = next(n for n in ast.walk(ast.parse(open(os.path.join(SRC, chk)).read()))
-              if isinstance(n, ast.FunctionDef) and n.name == "_should_eliminate_join")
-    ran = [ln for ln in out.get(chk, ()) if fn.body[0].lineno <= ln <= fn.end_lineno]
-    log("group files", len(out), "| worker-only lines seen in _should_eliminate_join:", len(ran))
-    if not ran:
-        raise SystemExit("worker processes were not measured: failing the build rather than ship a bad map")
     return out
 
 
-def read_coverage(index, group_lines, group_ids):
+def run_groups(ids_list, index):
+    """-> [(lines per file, set of test indexes it is credited to)].
+
+    Slow pool tests are run alone, so their coverage is exact. The rest share one run and
+    their workers' lines are credited to all of them.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    shutil.rmtree(GROUP, ignore_errors=True)
+    os.makedirs(GROUP)
+    pool = pool_tests(ids_list)
+    dur = durations()
+    slow = sorted((n for n in pool if dur.get(n, 0) >= HEAVY_S), key=lambda n: -dur[n])[:MAX_HEAVY]
+    light = [n for n in pool if n not in slow]
+    log("pool-using tests:", len(pool), "| run alone:", len(slow), "| shared:", len(light))
+    for n in slow:
+        log(f"  alone: {dur[n]:6.1f}s {n}")
+
+    shared = run_cov(light, "shared", True)
+    # Sanity check: a function body that only the pool workers run must show up.
+    chk = "sqlglot/optimizer/eliminate_joins.py"
+    fn = next(n for n in ast.walk(ast.parse(open(os.path.join(SRC, chk)).read()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_should_eliminate_join")
+    ran = [ln for ln in shared.get(chk, ()) if fn.body[0].lineno <= ln <= fn.end_lineno]
+    log("shared files", len(shared), "| worker-only lines seen in _should_eliminate_join:", len(ran))
+    if not ran:
+        raise SystemExit("worker processes were not measured: failing the build rather than ship a bad map")
+    groups = [(shared, {index[n] for n in light})]
+
+    def one(a):
+        i, n = a
+        return n, run_cov([n], f"one{i}", False)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for n, lines in ex.map(one, list(enumerate(slow))):
+            nfiles = sum(1 for f, s in lines.items() if f.startswith("sqlglot/") and s)
+            log(f"  alone result: {nfiles} sqlglot files measured for {n}")
+            if nfiles < 5:
+                raise SystemExit(f"coverage for {n} looks empty: failing the build")
+            groups.append((lines, {index[n]}))
+    return groups
+
+
+def read_coverage(index, groups):
     import coverage
 
     cd = coverage.CoverageData(basename=COV)
     cd.read()
     units, filehit = {}, {}
-    gset = {index[i] for i in group_ids}
     by_mod = {}
     for nid, i in index.items():
         by_mod.setdefault(nid.split("::")[0], set()).add(i)
     todo = {}
     for f in cd.measured_files():
         todo[os.path.relpath(f, SRC).replace(os.sep, "/")] = f
-    for rel in group_lines:
-        todo.setdefault(rel, os.path.join(SRC, rel))
+    for glines, _ in groups:
+        for rel in glines:
+            todo.setdefault(rel, os.path.join(SRC, rel))
     for rel, f in todo.items():
         if rel.startswith("..") or not rel.endswith(".py"):
             continue
@@ -187,12 +245,14 @@ def read_coverage(index, group_lines, group_ids):
                 owner[ln] = i
         hits = [set() for _ in us]
         fh = set()
-        glines = group_lines.get(rel, set())
-        if glines:
-            fh |= gset
-            for ln in glines:
+        for glines, gset in groups:
+            body = False
+            for ln in glines.get(rel, ()):
                 if ln < len(owner) and owner[ln] != -1:
                     hits[owner[ln]] |= gset
+                    body = True  # import-time lines do not count: every test imports the file
+            if body:
+                fh |= gset
         try:
             by_line = cd.contexts_by_lineno(f)
         except Exception:
@@ -317,10 +377,8 @@ def main():
     ids_list = collect_ids()
     run_tests()
     index = {nid: i for i, nid in enumerate(ids_list)}
-    group_ids = pool_tests(ids_list)
-    log("pool-using tests:", len(group_ids))
-    group_lines = run_group(group_ids)
-    units, filehit = read_coverage(index, group_lines, group_ids)
+    groups = run_groups(ids_list, index)
+    units, filehit = read_coverage(index, groups)
     names = dialect_names()
     mentions = scan_mentions(names, index)
 
