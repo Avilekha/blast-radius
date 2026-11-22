@@ -5,15 +5,14 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-# Build-time map: fetch sqlglot at the pinned commit, run its tests under per-test
-# coverage, write /app/map.json.gz. Kept before selector.py so editing the selector
-# does not re-run the tests.
+# map.json.gz was generated once by build_map.py (with fixture_tracker.py) inside this same
+# base image and is committed as a plain file. The build only fetches sqlglot at the pinned commit.
 COPY requirements.lock build_map.py fixture_tracker.py /app/
 RUN pip install --no-cache-dir -r /app/requirements.lock pytest-cov \
- && python /app/build_map.py \
- && rm -rf /tmp/cov /tmp/blast \
+ && cd /app && python -c "import build_map; build_map.fetch()" \
  && chmod -R a+rX /app /opt/sqlglot
 
+COPY map.json.gz /app/map.json.gz
 COPY selector.py /app/selector.py
-RUN chmod a+r /app/selector.py
+RUN chmod a+r /app/map.json.gz /app/selector.py
 CMD ["python", "/app/selector.py"]

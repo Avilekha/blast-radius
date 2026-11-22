@@ -27,3 +27,7 @@ No table from patches to failing tests is used; the maps come only from the pinn
 
 ## Run locally (PowerShell)
     .\run_sample.ps1
+
+## Generated map
+
+`map.json.gz` is generated once by `build_map.py` (with `fixture_tracker.py`) inside the pinned base image from sqlglot at the pinned commit, and committed as a plain file. The Dockerfile only fetches sqlglot at that commit and copies the map. To regenerate it, run `python /app/build_map.py` in an image built from the previous Dockerfile (commit 2a2094d) and copy out `/app/map.json.gz`.
