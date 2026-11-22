@@ -27,19 +27,40 @@ NOTHING_PREFIX = (".github/", "docs/", "posts/", "benchmarks/", "sqlglotrs/")
 NOTHING_SUFFIX = (".md", ".rst")
 
 
-# Runs in a throwaway interpreter: does the patched module still import?
-IMPORT_CHECK = """
-import importlib, importlib.abc, importlib.util, os, sys
-mod, tmp, is_pkg, root = sys.argv[1:5]
+# One long-lived helper: imports sqlglot once, then forks per patch to see if the patched module still imports.
+CHECKER = """
+import importlib, importlib.abc, importlib.util, json, os, signal, sys
+root = sys.argv[1]
+out = os.fdopen(os.dup(1), "w")
+os.dup2(2, 1)
 sys.path.insert(0, root)
-class Finder(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path, target=None):
-        if name == mod:
-            locs = [os.path.join(root, *mod.split("."))] if is_pkg == "1" else None
-            return importlib.util.spec_from_file_location(name, tmp, submodule_search_locations=locs)
-sys.meta_path.insert(0, Finder())
 import sqlglot
-importlib.import_module(mod)
+
+class Finder(importlib.abc.MetaPathFinder):
+    def __init__(self, mod, tmp, is_pkg):
+        self.mod, self.tmp, self.is_pkg = mod, tmp, is_pkg
+    def find_spec(self, name, path, target=None):
+        if name == self.mod:
+            locs = [os.path.join(root, *self.mod.split("."))] if self.is_pkg else None
+            return importlib.util.spec_from_file_location(name, self.tmp, submodule_search_locations=locs)
+
+for line in sys.stdin:
+    req = json.loads(line)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            signal.alarm(30)
+            sys.meta_path.insert(0, Finder(req["mod"], req["tmp"], req["pkg"]))
+            sys.modules.pop(req["mod"], None)
+            importlib.import_module(req["mod"])
+            os._exit(0)
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            os._exit(1)
+    _, status = os.waitpid(pid, 0)
+    out.write("ok\\n" if os.waitstatus_to_exitcode(status) == 0 else "fail\\n")
+    out.flush()
 """
 
 
@@ -206,6 +227,7 @@ class Sel:
         self.noimport = set(M.get("noimport", []))
         self.testimp = M.get("testimp", {})
         self.last_risky = False
+        self.checker = None
 
     def import_ok(self, path, new_text):
         """Would the patched module still import? Edits that crash at import fail nearly every test."""
@@ -220,14 +242,19 @@ class Sel:
             with tempfile.NamedTemporaryFile("w", suffix=".py", dir="/tmp", delete=False) as fh:
                 tmp = fh.name
                 fh.write(new_text)
-            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(SRC))
-            r = subprocess.run([sys.executable, "-c", IMPORT_CHECK, mod, tmp, "1" if is_pkg else "0", str(SRC)],
-                               env=env, capture_output=True, timeout=60)
-            if r.returncode != 0:
-                log(f"import check failed for {mod}: {r.stderr.decode(errors='replace')[-200:]}")
-            return r.returncode == 0
+            if self.checker is None or self.checker.poll() is not None:
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(SRC))
+                self.checker = subprocess.Popen([sys.executable, "-c", CHECKER, str(SRC)], env=env, text=True,
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
+            self.checker.stdin.write(json.dumps({"mod": mod, "tmp": tmp, "pkg": is_pkg}) + "\n")
+            self.checker.stdin.flush()
+            ok = self.checker.stdout.readline().strip() == "ok"
+            if not ok:
+                log(f"import check failed for {mod}")
+            return ok
         except Exception as e:
             log("import check error:", e)
+            self.checker = None
             return False
         finally:
             if tmp:
@@ -235,6 +262,14 @@ class Sel:
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def close(self):
+        if self.checker is not None:
+            try:
+                self.checker.stdin.close()
+                self.checker.wait(timeout=10)
+            except Exception:
+                self.checker.kill()
 
     def conv(self, lst):
         i2n = self.i2n
@@ -376,6 +411,8 @@ def main():
         workers = split(chosen, ms)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {sum(ms[n] for n in chosen) / 1000:.1f}s total")
+    if sel is not None:
+        sel.close()
 
 
 if __name__ == "__main__":
