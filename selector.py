@@ -19,6 +19,7 @@ DATA = Path(os.environ.get("DATA_DIR", "/data"))
 MAP_PATH = os.environ.get("MAP_PATH", "/app/map.json.gz")
 SRC = Path(os.environ.get("SRC_DIR", "/opt/sqlglot"))
 MAX_WORKERS, WORKER_MS = 8, 2000
+SWEEP_S = 5.0  # seconds: slower tests count as sweeps (see py_file)
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 DIALECT_FILE = re.compile(r"^sqlglot/(?:dialects|generators|parsers|typing)/([a-z0-9_]+)\.py$")
 ALL_ROOT = {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py",
@@ -216,6 +217,7 @@ class Sel:
     def __init__(self, M, tests):
         self.M = M
         self.n = len(tests)
+        self.sec = {t["number"]: t["seconds"] for t in tests}
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
@@ -228,6 +230,7 @@ class Sel:
         self.testimp = M.get("testimp", {})
         self.last_risky = False
         self.checker = None
+        self._sweeps = None
 
     def import_ok(self, path, new_text):
         """Would the patched module still import? Edits that crash at import fail nearly every test."""
@@ -312,12 +315,31 @@ class Sel:
             raise AllTests("patched module no longer imports: " + path)
         dm = DIALECT_FILE.match(path)
         if top:
-            sel |= self.conv(M["filehit"].get(path, []))
+            fh = self.conv(M["filehit"].get(path, []))
             if dm and dm.group(1) in self.dialects:
+                named = set()
                 for n in {dm.group(1)} | set(M.get("desc", {}).get(dm.group(1), ())):
-                    sel |= self.conv(M["mentions"].get(n, []))
-                    sel |= set(self.by_file.get(f"tests/dialects/test_{n}.py", []))
+                    named |= self.conv(M["mentions"].get(n, []))
+                    named |= set(self.by_file.get(f"tests/dialects/test_{n}.py", []))
+                # a slow test that merely ran some code in this file (it sweeps every dialect) but never
+                # names this dialect is a poor bet for a class-level edit: it costs more than a miss risk
+                slow = {n for n in self.sweeps() if self.sec[n] >= SWEEP_S}
+                fh = {n for n in fh if self.sec[n] < SWEEP_S or n in named}
+                fh |= named
+                fh -= slow
+            sel |= fh
         return sel
+
+    def sweeps(self):
+        """Tests that name at least half of all dialects (they loop over every dialect)."""
+        if self._sweeps is None:
+            cnt = {}
+            for n in self.dialects:
+                for i in self.M["mentions"].get(n, ()):
+                    cnt[i] = cnt.get(i, 0) + 1
+            need = max(3, len(self.dialects) // 2)
+            self._sweeps = self.conv([i for i, c in cnt.items() if c >= need])
+        return self._sweeps
 
     def file(self, fp):
         if fp.binary:

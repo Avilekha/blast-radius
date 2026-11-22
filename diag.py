@@ -17,4 +17,8 @@ for line in open(out):
     miss += bool(missed)
     flag = "MISS " + ", ".join(tests[n]["id"] for n in missed) if missed else ""
     print(f'{r["commit"]:6} {a["kind"]:8} sel={len(sel):5} {secs:7.1f}s fail={len(a["failing"]):3} {flag}')
+    heavy = sorted((n for n in sel if n not in a["failing"] and tests[n]["seconds"] >= 1.0),
+                   key=lambda n: -tests[n]["seconds"])[:4]
+    for n in heavy:
+        print(f'         wasted {tests[n]["seconds"]:6.1f}s  {tests[n]["id"]}')
 print(f"misses={miss} selected_seconds_total={tot:.1f}")
