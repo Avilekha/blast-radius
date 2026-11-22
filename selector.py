@@ -205,6 +205,29 @@ def classify(units, ln):
     return res, body is None
 
 
+def owner_class(tree, ln):
+    """Dotted names of the classes whose body (not a method) holds line ln; None if a method or decorator does."""
+    names, node = [], tree
+    while True:
+        nxt = None
+        for ch in ast.iter_child_nodes(node):
+            lo = getattr(ch, "lineno", None)
+            if lo is None:
+                continue
+            decos = getattr(ch, "decorator_list", None) or []
+            lo = min([lo] + [d.lineno for d in decos])
+            if lo <= ln <= (ch.end_lineno or lo):
+                nxt = ch
+                break
+        if nxt is None:
+            return names
+        if isinstance(nxt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return None
+        if isinstance(nxt, ast.ClassDef):
+            names.append(nxt.name)
+        node = nxt
+
+
 def inside(units, p):
     best = None
     for u in units:
@@ -314,6 +337,8 @@ class Sel:
         if self.last_risky and path.startswith("sqlglot/") and not self.import_ok(path, "\n".join(new_lines)):
             raise AllTests("patched module no longer imports: " + path)
         dm = DIALECT_FILE.match(path)
+        if top and M.get("inst") and path.startswith("sqlglot/"):
+            sel |= self.class_tests(path, old_src, removed, inserts)
         if top:
             fh = self.conv(M["filehit"].get(path, []))
             if dm and dm.group(1) in self.dialects:
@@ -329,6 +354,25 @@ class Sel:
                 fh -= slow
             sel |= fh
         return sel
+
+    def class_tests(self, path, old_src, removed, inserts):
+        """An edit in a class body (arg_types, class attributes) reaches every test that creates that
+        class or a subclass of it."""
+        out = set()
+        try:
+            tree = ast.parse(old_src)
+        except (SyntaxError, ValueError):
+            return out
+        mod = path[:-3].replace("/", ".")
+        lines = set(removed)
+        for p, _ in inserts:
+            lines |= {p - 1, p}
+        inst = self.M["inst"]
+        for ln in lines:
+            names = owner_class(tree, ln) if ln > 0 else None
+            if names:
+                out |= self.conv(inst.get(mod + "." + ".".join(names), ()))
+        return out
 
     def sweeps(self):
         """Tests that name at least half of all dialects (they loop over every dialect)."""

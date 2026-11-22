@@ -507,6 +507,19 @@ def main():
         except Exception:
             pass
 
+    inst = {}
+    for path in glob.glob(os.path.join(BLAST, "inst-*.json")):
+        d = json.load(open(path))
+        for nid, ks in d["tests"].items():
+            if nid in index:
+                for k in ks:
+                    inst.setdefault(k, set()).add(index[nid])
+        for mod, ks in d["mods"].items():  # created in collection / setup: serves every test of the module
+            members = [i for n, i in index.items() if n.split("::")[0] == mod]
+            for k in ks:
+                inst.setdefault(k, set()).update(members)
+    log("class-creation map:", len(inst), "classes")
+
     ids_out = [None] * len(index)
     for nid, i in index.items():
         ids_out[i] = nid
@@ -523,6 +536,7 @@ def main():
         "desc": dialect_descendants(names),
         "testimp": test_importers(),
         "noimport": find_noimport(),
+        "inst": {k: sorted(v) for k, v in inst.items()},
     }
     with gzip.open(OUT, "wt", compresslevel=6) as fh:
         json.dump(m, fh, separators=(",", ":"))
